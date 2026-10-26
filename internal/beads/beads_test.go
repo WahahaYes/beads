@@ -1746,6 +1746,16 @@ func TestFindBeadsDir_WorktreeRedirectOverride(t *testing.T) {
 	if resultResolved != topicBeadsDirResolved {
 		t.Errorf("FindBeadsDir() = %q, want topic .beads %q (via worktree redirect)", result, topicBeadsDirResolved)
 	}
+
+	// bd -C must honor the same redirect, although the topic has no database
+	// and the main repo's store has one.
+	t.Chdir(t.TempDir())
+	git.ResetCaches()
+	fromResult := FindBeadsDirFrom(worktreeDir)
+	fromResolved, _ := filepath.EvalSymlinks(fromResult)
+	if fromResolved != topicBeadsDirResolved {
+		t.Errorf("FindBeadsDirFrom(worktree) = %q, want topic .beads %q (via worktree redirect, what cd binds)", fromResult, topicBeadsDirResolved)
+	}
 }
 
 // TestFindDatabasePath_WorktreeRedirectOverride tests that findDatabaseInTree
@@ -2982,7 +2992,26 @@ func TestFindBeadsDirFromLinkedWorktreeBoundary(t *testing.T) {
 			wantMain: true,
 		},
 		{
-			name: "no main checkout store keeps walking to the parent store",
+			// The shared-server shape: a clone carries the committed
+			// metadata.json while the data lives on the shared server, so
+			// the main checkout's store has no local database.
+			name: "main checkout store without a database still stops the walk",
+			mutate: func(t *testing.T, mainStore, worktree string) {
+				if err := os.MkdirAll(mainStore, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(mainStore, "metadata.json"), []byte(`{"database":"dolt"}`), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantMain: true,
+		},
+		{
+			// Parity holds here because the fixture's worktree is a sibling of
+			// its main checkout. For a worktree nested inside its main checkout,
+			// FindBeadsDir's extended walk stops at the main checkout root,
+			// while FindBeadsDirFrom keeps walking.
+			name: "no main checkout store keeps walking past a sibling worktree to the parent store",
 			mutate: func(t *testing.T, mainStore, worktree string) {
 			},
 			wantMain: false,
