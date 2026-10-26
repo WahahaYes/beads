@@ -995,6 +995,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `bd doctor` no longer flags a private `.beads/.gitignore` (such as 0400),
+  and `--fix`, `bd init`, `bd bootstrap` and `bd connect` no longer add
+  owner-write to one; only group/other bits count as loose, and Windows is
+  skipped. `bd bootstrap` now warns instead of failing after a successful
+  clone when `.beads/.gitignore` cannot be updated (#6225).
 - **A nested `bd init --server` no longer creates its database on the
   enclosing workspace's Dolt server.** In a directory nested in a workspace
   whose `.beads/config.yaml` names `dolt.port`, `bd init --server` with no
