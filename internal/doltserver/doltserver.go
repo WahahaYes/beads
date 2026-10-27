@@ -735,6 +735,66 @@ func IsTrackedServerRunning(beadsDir string) bool {
 	return isProcessAlive(pid) && isDoltProcess(pid)
 }
 
+// ServerInfoFileName is the file `dolt sql-server` keeps in the .dolt
+// directory of the data directory it serves, as pid:port:secret, while it
+// runs. A dolt CLI command run in a database that a live server holds reads
+// it to hand the command to that server, through localhost:port.
+const ServerInfoFileName = "sql-server.info"
+
+// ServesDatabaseDirOnPort reports whether dir, a Dolt database directory, is
+// served by a live dolt sql-server listening on port: the server info file
+// in dir's own .dolt (a server started in the database) or else in its
+// parent's (a multi-database data directory, as bd's own server serves
+// .beads/dolt) names port and a live process. The first live file found
+// decides. A database directory nothing serves has no such file, or one
+// whose process is gone, so a dolt CLI run there works on its files instead
+// of handing the command to the server on port.
+//
+// A file whose process is gone counts as absent and the parent's is read:
+// the dolt CLI removes such a file on its first run there, after which it
+// finds the parent's, so a crashed server's leftover file in the database
+// does not take the database off its live parent server's route.
+//
+// It is not the dolt CLI's lookup exactly. The dolt CLI searches every
+// ancestor directory, not only the parent; a server this misses that way
+// gets bd's SQL route, which reaches it anyway. And the dolt CLI reads the
+// file only when it cannot lock the database, while this reads it always,
+// as bd's route choice did before it looked at the file at all. Liveness is
+// the dolt CLI's test (serverInfoProcessExists), so a process of another
+// user counts as live. Read-only; it never removes a stale file itself, and
+// runs no ps.
+func ServesDatabaseDirOnPort(dir string, port int) bool {
+	if dir == "" || port <= 0 {
+		return false
+	}
+	for _, d := range []string{dir, filepath.Dir(dir)} {
+		data, err := os.ReadFile(filepath.Join(d, ".dolt", ServerInfoFileName)) //nolint:gosec // G304: fixed file name in the store's CLIDir or its parent
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return false
+		}
+		parts := strings.Split(strings.TrimSpace(string(data)), ":")
+		if len(parts) != 3 {
+			return false
+		}
+		pid, perr := strconv.Atoi(parts[0])
+		infoPort, portErr := -1, error(nil) // "-": a socket-only server
+		if parts[1] != "-" {
+			infoPort, portErr = strconv.Atoi(parts[1])
+		}
+		if perr != nil || portErr != nil || pid <= 0 {
+			return false
+		}
+		if !serverInfoProcessExists(pid) {
+			continue
+		}
+		return infoPort == port
+	}
+	return false
+}
+
 // PortFileSnapshot captures the exact prior contents of a project's port
 // file, so a caller that speculatively lets EnsureRunningDetailed write a
 // new one can restore the pre-call state exactly if it later decides not to

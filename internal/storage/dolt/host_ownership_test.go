@@ -3,6 +3,7 @@ package dolt
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/configfile"
@@ -32,6 +33,26 @@ func leftoverDatabaseStore(t *testing.T, beadsDir string, cfg *Config) *DoltStor
 		t.Fatalf("record a remote in %s: %v", store.CLIDir(), err)
 	}
 	return store
+}
+
+// testServedPort is the port the stand-in Dolt server of the tests below
+// listens on.
+const testServedPort = 3307
+
+// serveDoltDir records in dir/.dolt the server info file `dolt sql-server`
+// keeps in the data directory it serves while it runs (pid:port:secret), so
+// that a dolt CLI command run in a database under dir is handed to that
+// server. It is the proof doltserver.ServesDatabaseDirOnPort reads; the
+// tests' own process stands in for a live server.
+func serveDoltDir(t *testing.T, dir string, pid, port int) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	info := strconv.Itoa(pid) + ":" + strconv.Itoa(port) + ":secret"
+	if err := os.WriteFile(filepath.Join(dir, ".dolt", doltserver.ServerInfoFileName), []byte(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // checkLeftoverDatabaseDecisions asserts that the CLI routes take the
@@ -99,10 +120,18 @@ func TestStoreHostOwnershipDecisionsAgree(t *testing.T) {
 			}
 
 			// A Dolt database left in .beads/dolt/<db> is the server's only
-			// where bd runs the server; elsewhere the CLI routes must not
-			// push or pull it in the server's place, nor its remotes stand in
-			// for the server's.
-			checkLeftoverDatabaseDecisions(t, leftoverDatabaseStore(t, t.TempDir(), &Config{ServerHost: host}), bd, "host "+host)
+			// where bd runs the server and a live server on the dialed port
+			// serves it; elsewhere the CLI routes must not push or pull it in
+			// the server's place, nor its remotes stand in for the server's.
+			// A copy no server holds counts for nothing even at bd's host:
+			// the dolt CLI would work on its files directly. Where a server
+			// on the dialed port does serve it, bd's own server keeps the
+			// directory and its recorded remotes (the GH#2118 veto).
+			unserved := leftoverDatabaseStore(t, t.TempDir(), &Config{ServerHost: host, ServerPort: testServedPort})
+			checkLeftoverDatabaseDecisions(t, unserved, false, "host "+host+", a copy nothing serves")
+			served := leftoverDatabaseStore(t, t.TempDir(), &Config{ServerHost: host, ServerPort: testServedPort})
+			serveDoltDir(t, served.dbPath, os.Getpid(), testServedPort)
+			checkLeftoverDatabaseDecisions(t, served, bd, "host "+host+", served on the dialed port")
 
 			cfg := &Config{BeadsDir: managedWorkspace(t, 3307), ServerHost: host, ServerPort: 3307}
 			if got := !sharedServerDatabase(cfg); got != bd {
@@ -123,6 +152,38 @@ func TestStoreHostOwnershipDecisionsAgree(t *testing.T) {
 		})
 	}
 
+	// At 127.0.0.1 with no port variable set, the directory is the server's
+	// only where the server info file the dolt CLI finds for it names the
+	// dialed port and a live process: a server on another port, or one that
+	// has exited, does not serve it, and nothing reads the store's port
+	// without a Config. A server started in the database itself serves it.
+	for _, tc := range []struct {
+		name  string
+		serve func(t *testing.T, store *DoltStore)
+		port  int
+		want  bool
+	}{
+		{"server on another port", func(t *testing.T, s *DoltStore) { serveDoltDir(t, s.dbPath, os.Getpid(), testServedPort+1) }, testServedPort, false},
+		{"server gone", func(t *testing.T, s *DoltStore) { serveDoltDir(t, s.dbPath, deadPID, testServedPort) }, testServedPort, false},
+		{"no dialed port", func(t *testing.T, s *DoltStore) { serveDoltDir(t, s.dbPath, os.Getpid(), testServedPort) }, 0, false},
+		{"server started in the database", func(t *testing.T, s *DoltStore) { serveDoltDir(t, s.CLIDir(), os.Getpid(), testServedPort) }, testServedPort, true},
+	} {
+		t.Run("host=127.0.0.1/"+tc.name, func(t *testing.T) {
+			clearPredicateEnv(t)
+			clearSizingModeEnv(t)
+			store := leftoverDatabaseStore(t, t.TempDir(), &Config{ServerHost: "127.0.0.1", ServerPort: tc.port})
+			tc.serve(t, store)
+			checkLeftoverDatabaseDecisions(t, store, tc.want, "127.0.0.1, "+tc.name)
+		})
+	}
+	t.Run("host=127.0.0.1/no Config", func(t *testing.T) {
+		clearPredicateEnv(t)
+		clearSizingModeEnv(t)
+		store := leftoverDatabaseStore(t, t.TempDir(), nil)
+		serveDoltDir(t, store.dbPath, os.Getpid(), testServedPort)
+		checkLeftoverDatabaseDecisions(t, store, false, "a store without a Config")
+	})
+
 	// bd's own server is a plain TCP server: a gateway, a TLS endpoint and a
 	// unix socket are someone else's even at 127.0.0.1, so the workspace's
 	// Dolt root is neither their local data directory nor a database the
@@ -140,11 +201,14 @@ func TestStoreHostOwnershipDecisionsAgree(t *testing.T) {
 			clearSizingModeEnv(t)
 			beadsDir := t.TempDir()
 			cfg := tc.cfg
-			cfg.Path, cfg.BeadsDir, cfg.Database, cfg.ServerHost, cfg.AutoStart = filepath.Join(beadsDir, "dolt"), beadsDir, "active", "127.0.0.1", true
+			cfg.Path, cfg.BeadsDir, cfg.Database, cfg.ServerHost, cfg.ServerPort, cfg.AutoStart = filepath.Join(beadsDir, "dolt"), beadsDir, "active", "127.0.0.1", testServedPort, true
 			if dataDir := resolveLocalActiveDatabaseDir(&cfg); dataDir != "" {
 				t.Errorf("resolveLocalActiveDatabaseDir(%s) = %q, want none", tc.name, dataDir)
 			}
-			checkLeftoverDatabaseDecisions(t, leftoverDatabaseStore(t, beadsDir, &cfg), false, tc.name+" at 127.0.0.1")
+			// Even served on that port, the transport is not bd's.
+			store := leftoverDatabaseStore(t, beadsDir, &cfg)
+			serveDoltDir(t, store.dbPath, os.Getpid(), testServedPort)
+			checkLeftoverDatabaseDecisions(t, store, false, tc.name+" at 127.0.0.1")
 		})
 	}
 
@@ -166,10 +230,14 @@ func TestStoreHostOwnershipDecisionsAgree(t *testing.T) {
 			bdServerOnPort int
 			// notDolt records a live process that is not a dolt sql-server.
 			notDolt bool
-			want    bool
+			// unserved leaves the directory without a server info file:
+			// no server on the port serves it.
+			unserved bool
+			want     bool
 		}{
 			{name: "no server bd runs"},
 			{name: "bd server on that port", bdServerOnPort: 3310, want: true},
+			{name: "bd server on that port, directory not served", bdServerOnPort: 3310, unserved: true},
 			{name: "bd server on another port", bdServerOnPort: 3311},
 			{name: "a process that is not dolt on that port", bdServerOnPort: 3310, notDolt: true},
 		} {
@@ -191,6 +259,9 @@ func TestStoreHostOwnershipDecisionsAgree(t *testing.T) {
 					t.Errorf("resolveLocalActiveDatabaseDir with %s set = %q, want none: the variable may name any server", portVar, dataDir)
 				}
 				store := leftoverDatabaseStore(t, beadsDir, &Config{ServerHost: "127.0.0.1", ServerPort: 3310, BeadsDir: beadsDir})
+				if !tc.unserved {
+					serveDoltDir(t, store.dbPath, os.Getpid(), 3310)
+				}
 				checkLeftoverDatabaseDecisions(t, store, tc.want, portVar+" set, "+tc.name)
 			})
 		}

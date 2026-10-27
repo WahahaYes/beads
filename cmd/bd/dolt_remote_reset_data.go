@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
+	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/githooksenv"
 	"github.com/steveyegge/beads/internal/remedy"
 	"github.com/steveyegge/beads/internal/storage"
@@ -34,8 +37,11 @@ const (
 type resetDataKind int
 
 const (
-	// resetDataGitBacked: delete the Dolt data refs on the git remote, then
-	// force-push to rebuild a fresh store holding only live chunks.
+	// resetDataGitBacked: rebuild a fresh store holding only live chunks and
+	// replace the Dolt data refs on the git remote with it: in embedded mode
+	// by deleting the refs and force-pushing, through a Dolt sql-server by
+	// pushing to a temporary ref and moving the data ref to it
+	// (resetGitBackedThroughServer).
 	resetDataGitBacked resetDataKind = iota
 	// resetDataFileStore: clear the native Dolt file-store directory, then
 	// force-push to rebuild it.
@@ -192,8 +198,12 @@ pre-squash store. This command rebuilds the remote's data plane so it holds
 only live chunks:
 
   - Git-backed remotes (issue data riding a git remote under refs/dolt/data):
-    deletes the Dolt data refs on the git remote, then force-pushes to
-    rebuild a fresh store. Code branches are untouched.
+    rebuilds a fresh store from local HEAD and replaces the remote's Dolt
+    data refs with it (through a Dolt sql-server it pushes the fresh store
+    to a temporary ref first, so the remote keeps its data until the new
+    store is complete, then restarts bd's own server so that it rereads
+    the remote; any other server must be restarted before its next push or
+    pull of the remote). Code branches are untouched.
   - Native file remotes (file:// paths): clears the store directory, then
     force-pushes to rebuild it.
   - Cloud/hosted remotes (aws://, gs://, dolthub://, ...): bd cannot clear
@@ -236,10 +246,10 @@ Examples:
 		if err != nil {
 			return HandleError("listing remotes: %v", err)
 		}
-		var url string
+		var url, ref string
 		for _, r := range remotes {
 			if r.Name == name {
-				url = r.URL
+				url, ref = r.URL, r.Ref
 				break
 			}
 		}
@@ -303,6 +313,17 @@ Examples:
 
 		var deletedRefs []string
 		var clearedStore bool
+		// Only a git+ URL is a git remote to Dolt (a file:// URL to a bare
+		// git directory is a native file store to it, which takes no data
+		// ref), so only that takes the temporary-ref route; the rest keep
+		// the flow below.
+		if kind == resetDataGitBacked && !isEmbeddedStore(st) && doltutil.IsGitProtocolURL(url) {
+			replaced, rerr := resetGitBackedThroughServer(ctx, st, name, url, ref)
+			if rerr != nil {
+				return HandleError("%v", rerr)
+			}
+			return reportResetData(name, url, replaced, false, refreshServerAfterReset(st, name))
+		}
 		switch kind {
 		case resetDataGitBacked:
 			gitURL := resetDataGitURL(url)
@@ -336,17 +357,257 @@ Examples:
 			return HandleError("push after reset failed (the remote's data refs were already removed — re-run `bd dolt push --force --remote %s`%s once the cause is fixed): %v", remote, note, perr)
 		}
 
-		if jsonOutput {
-			return outputJSON(map[string]interface{}{
-				"remote":        name,
-				"url":           url,
-				"deleted_refs":  deletedRefs,
-				"cleared_store": clearedStore,
-				"pushed":        true,
-			})
-		}
-		fmt.Printf("✓ Remote %q data plane reset; store rebuilt from HEAD.\n", name)
-		fmt.Println("  Other clones of this database must re-clone from the remote.")
-		return nil
+		return reportResetData(name, url, deletedRefs, clearedStore, nil)
 	},
+}
+
+// resetDataServerRefresh is what a reset through a Dolt sql-server did about
+// the server's view of the remote: restarted bd's own server, or names the
+// restart the server needs.
+type resetDataServerRefresh struct {
+	restarted bool
+	// required is the server-restart notice, set when the server still
+	// holds its pre-reset view of the remote.
+	required string
+}
+
+// refreshServerAfterReset makes the Dolt server drop its view of remote
+// after resetGitBackedThroughServer moved the remote's data ref under it. A
+// sql-server keeps one store per git remote URL and ref for its whole life,
+// and that store's cache of the remote's table files only grows: after the
+// move it still takes table files of the old store, which the fresh one
+// lacks, as present on the remote, so a later push through it can write a
+// manifest naming files the remote does not hold, or report a branch as
+// up to date that the remote no longer has. Only a restart clears it. bd
+// restarts the server when it is the one bd manages for this workspace
+// (ManagedServerDir: the dialed port is the tracked server's), keeping its
+// port; any other server is the operator's to restart, which the report
+// says.
+func refreshServerAfterReset(st storage.DoltStorage, remote string) *resetDataServerRefresh {
+	needed := fmt.Sprintf("restart the Dolt server before the next push or pull of remote %s: it still holds its pre-reset view of the remote", remedy.PrintedValue(remote))
+	m, ok := storage.UnwrapStore(st).(interface{ ManagedServerDir() (string, bool) })
+	if !ok {
+		return &resetDataServerRefresh{required: needed}
+	}
+	serverDir, managed := m.ManagedServerDir()
+	if !managed {
+		return &resetDataServerRefresh{required: needed}
+	}
+	if _, err := doltserver.Restart(serverDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: restarting the Dolt server after the reset failed: %v\n", err)
+		return &resetDataServerRefresh{required: needed}
+	}
+	return &resetDataServerRefresh{restarted: true}
+}
+
+// reportResetData prints reset-data's success report. refresh is nil for a
+// reset that ran no push through a Dolt sql-server's temporary remote.
+func reportResetData(name, url string, deletedRefs []string, clearedStore bool, refresh *resetDataServerRefresh) error {
+	if jsonOutput {
+		out := map[string]interface{}{
+			"remote":        name,
+			"url":           url,
+			"deleted_refs":  deletedRefs,
+			"cleared_store": clearedStore,
+			"pushed":        true,
+		}
+		if refresh != nil {
+			out["server_restarted"] = refresh.restarted
+			out["server_restart_required"] = refresh.required != ""
+			if refresh.required != "" {
+				out["warning"] = refresh.required
+			}
+		}
+		return outputJSON(out)
+	}
+	fmt.Printf("✓ Remote %q data plane reset; store rebuilt from HEAD.\n", name)
+	if refresh != nil && refresh.restarted {
+		fmt.Println("  Restarted bd's Dolt server so that it rereads the remote.")
+	}
+	if refresh != nil && refresh.required != "" {
+		fmt.Printf("  Warning: %s.\n", refresh.required)
+	}
+	fmt.Println("  Other clones of this database must re-clone from the remote.")
+	return nil
+}
+
+// resetGitBackedThroughServer rebuilds a git-backed remote's Dolt data plane
+// for a store whose pushes run in a Dolt sql-server, without ever leaving the
+// remote without its data. A sql-server keeps the store of every git remote
+// it has pushed to or pulled from for its whole life, and once the remote's
+// data ref is deleted under it, that store still holds the old manifest: a
+// force push to the remote then either reports success having written
+// nothing or never finishes, until the server restarts. So this pushes a
+// fresh store to a ref of its own (a remote the server has not opened yet),
+// then moves the data ref to it with git, from the value it read first, and
+// removes the temporary ref and remote. Until the move the remote keeps its
+// old data; the move replaces it in one ref update. The server's store for
+// the remote itself is still the pre-reset one afterwards, which the caller
+// clears (refreshServerAfterReset).
+func resetGitBackedThroughServer(ctx context.Context, st storage.DoltStorage, name, url, ref string) ([]string, error) {
+	gitURL := resetDataGitURL(url)
+	dataRef := storage.EffectiveGitDataRef(ref)
+	before, err := lsRemoteRefOID(ctx, gitURL, dataRef)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, 4)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("naming the temporary remote: %w", err)
+	}
+	tmpName := "bd-reset-data-" + hex.EncodeToString(nonce)
+	tmpRef := "refs/dolt/" + tmpName
+	remote, note := remedy.CommandArg(runtime.GOOS, name, "<remote>")
+	rerun := "`bd dolt remote reset-data " + remote + " --yes`" + note
+	if err := st.AddRemoteWithRef(ctx, tmpName, url, tmpRef); err != nil {
+		return nil, fmt.Errorf("adding the temporary remote %s on the Dolt server failed; the remote's Dolt data is unchanged (re-run %s once the cause is fixed): %w", tmpName, rerun, err)
+	}
+	// Cleanup runs even after Ctrl-C canceled ctx, so an interrupted reset
+	// does not leave the temporary remote or ref behind.
+	cleanupCtx := context.WithoutCancel(ctx)
+	defer func() {
+		rctx, cancel := context.WithTimeout(cleanupCtx, 60*time.Second)
+		defer cancel()
+		if err := st.RemoveRemote(rctx, tmpName); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove the temporary remote %s from the Dolt server (bd dolt remote remove %s): %v\n", tmpName, tmpName, err)
+		}
+	}()
+	// leftover names the temporary ref a failed delete left on the remote,
+	// with the command that deletes it.
+	leftover := func(err error) string {
+		u, unote := remedy.CommandArg(runtime.GOOS, gitURL, "<url>")
+		return fmt.Sprintf("the temporary ref %s holding a copy of the fresh store remains on the remote; delete it with `git push %s :%s`%s: %v", tmpRef, u, tmpRef, unote, err)
+	}
+	// failWith deletes the temporary ref after a failed step and returns
+	// failure, naming the ref when it could not be deleted. A push that
+	// failed before writing it leaves no ref, which is no leftover.
+	failWith := func(failure error) ([]string, error) {
+		cerr := deleteTempGitRef(cleanupCtx, gitURL, tmpRef)
+		if cerr == nil {
+			return nil, failure
+		}
+		if oid, lerr := lsRemoteRefOID(cleanupCtx, gitURL, tmpRef); lerr == nil && oid == "" {
+			return nil, failure
+		}
+		return nil, fmt.Errorf("%w; %s", failure, leftover(cerr))
+	}
+	fmt.Printf("Pushing a fresh store to %s on %s...\n", tmpRef, gitURL)
+	if err := st.PushRemote(ctx, tmpName, true); err != nil {
+		return failWith(fmt.Errorf("pushing a fresh store failed; the remote's Dolt data is unchanged (re-run %s once the cause is fixed): %w", rerun, err))
+	}
+	if err := moveGitRef(ctx, gitURL, tmpRef, dataRef, before); err != nil {
+		return failWith(fmt.Errorf("replacing %s with the fresh store failed; the remote's Dolt data is unchanged (re-run %s once the cause is fixed): %w", dataRef, rerun, err))
+	}
+	if err := deleteTempGitRef(cleanupCtx, gitURL, tmpRef); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", leftover(err))
+	}
+	fmt.Printf("Replaced %s on %s with the fresh store\n", dataRef, gitURL)
+	if before == "" {
+		return nil, nil
+	}
+	return []string{dataRef}, nil
+}
+
+// deleteTempGitRef deletes ref on the git remote at gitURL from a scratch
+// repository, so it does not depend on bd's working directory being inside a
+// git repository (a BEADS_DIR workspace need not be). Hooks are disabled as
+// for deleteGitDoltDataRefs, and the push is bounded so cleanup cannot hang.
+// A ref the remote does not hold is nothing to delete.
+func deleteTempGitRef(ctx context.Context, gitURL, ref string) error {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	// The ref's object ID gives the remote's object format, which the
+	// scratch repository must share for git to push to it. An absent ref
+	// has nothing to delete.
+	oid, err := lsRemoteRefOID(ctx, gitURL, ref)
+	if err != nil {
+		return err
+	}
+	if oid == "" {
+		return nil
+	}
+	dir, err := os.MkdirTemp("", "bd-reset-data-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	git := func(args ...string) error {
+		cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir", dir}, args...)...) // #nosec G204 -- URL from configured remote, fixed refspec
+		cmd.Env = envWithNoGitHooks()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git %s (delete %s) failed: %s: %w", args[0], ref, strings.TrimSpace(string(out)), err)
+		}
+		return nil
+	}
+	if err := git(scratchGitInitArgs(oid)...); err != nil {
+		return err
+	}
+	return git("push", "-q", gitURL, ":"+ref)
+}
+
+// scratchGitInitArgs returns the git init arguments for a scratch
+// repository that exchanges objects with a remote holding oid. git fetches
+// and pushes only between repositories of one object format, so a SHA-256
+// remote (64-hex object IDs) needs --object-format=sha256, as Dolt's own
+// cache repository for the remote gets (dbfactory remoteInitFlags). A SHA-1
+// remote gets no flag, so git older than 2.29, which lacks it, still works.
+func scratchGitInitArgs(oid string) []string {
+	args := []string{"init", "--bare", "-q"}
+	if len(oid) == 64 {
+		args = append(args, "--object-format=sha256")
+	}
+	return args
+}
+
+// lsRemoteRefOID returns the object ID ref names on the git remote at gitURL,
+// or "" when the remote has no such ref.
+func lsRemoteRefOID(ctx context.Context, gitURL, ref string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", "ls-remote", gitURL, ref).CombinedOutput() // #nosec G204 -- URL from configured remote
+	if err != nil {
+		return "", fmt.Errorf("git ls-remote %s failed: %s: %w", gitURL, strings.TrimSpace(string(out)), err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if fields := strings.Fields(line); len(fields) == 2 && fields[1] == ref {
+			return fields[0], nil
+		}
+	}
+	return "", nil
+}
+
+// moveGitRef points ref on the git remote at gitURL at the commit src names
+// there, provided ref still holds before ("" for absent). git pushes only
+// from objects it has, so it fetches src's commit into a scratch repository
+// of the remote's object format first: with a filter where the remote
+// supports one, else the whole commit, which the push then does not send
+// back.
+func moveGitRef(ctx context.Context, gitURL, src, ref, before string) error {
+	srcOID, err := lsRemoteRefOID(ctx, gitURL, src)
+	if err != nil {
+		return err
+	}
+	if srcOID == "" {
+		return fmt.Errorf("%s is not on the remote", src)
+	}
+	dir, err := os.MkdirTemp("", "bd-reset-data-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	git := func(args ...string) error {
+		cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir", dir}, args...)...) // #nosec G204 -- URL from configured remote, fixed refspecs
+		cmd.Env = envWithNoGitHooks()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git %s failed: %s: %w", args[0], strings.TrimSpace(string(out)), err)
+		}
+		return nil
+	}
+	if err := git(scratchGitInitArgs(srcOID)...); err != nil {
+		return err
+	}
+	if err := git("fetch", "-q", "--no-tags", "--depth=1", "--filter=tree:0", gitURL, "+"+src+":refs/bd-reset-data/new"); err != nil {
+		return err
+	}
+	return git("push", "-q", "--force-with-lease="+ref+":"+before, gitURL, "refs/bd-reset-data/new:"+ref)
 }

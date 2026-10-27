@@ -995,6 +995,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`bd dolt push`, `bd dolt pull`, `bd sync` and auto-push no longer move
+  a stale copy of the database for a server on `127.0.0.1` that does not
+  serve it.** For a plain TCP Dolt server on `127.0.0.1` whose port is
+  pinned by `dolt_server_port`, `dolt.port` or external mode (no port
+  variable set), bd ran the dolt CLI in `.beads/dolt/<database>` whenever
+  a Dolt database was there, such as the database from when bd ran the
+  workspace's server or a clone `bd init` left. When the server bd dials
+  serves another data directory (a container, another checkout), nothing
+  holds that copy, so the dolt CLI pushed it: "Push complete." was printed
+  without the server's commits, `--force` replaced the remote's branch with
+  the copy's, and a pull merged into the copy. The copy's remotes also
+  counted as the server's, so `bd dolt remote add` reported the remote as
+  added while the server still listed none. bd now takes that directory as
+  the server's data only when the `sql-server.info` dolt keeps for it (in
+  the database's `.dolt`, else in its parent's) names the dialed port and a
+  live process, by the dolt CLI's liveness test. Otherwise the transfers run
+  on the server (`CALL DOLT_PUSH`, `CALL DOLT_PULL`, `CALL DOLT_FETCH`),
+  the copy's remotes are reported as the copy's, and `bd dolt remote add`
+  adds the remote on the server. bd's own server, and a server you run over
+  `.beads/dolt` on `127.0.0.1`, serve that directory and keep the dolt CLI
+  route, including the recovery when a freshly started server does not yet
+  list a remote recorded on disk (GH#2118).
+- When the Dolt server lists no remote while a Dolt database in
+  `.beads/dolt/<database>` records one, `bd dolt push`, `bd dolt pull` and
+  `bd sync` no longer say that database "is not the server's data". The
+  server may serve it (a server you run over `.beads/dolt` on a unix
+  socket, `::1` or TLS); the error now says bd cannot confirm that it does.
+  The exit status and the `bd dolt remote add` remedy are unchanged.
+- **`bd dolt remote reset-data` no longer leaves a git-backed remote without
+  its Dolt data when the workspace pushes through a Dolt sql-server.** It
+  deleted the remote's Dolt data refs and then force-pushed through the
+  server, but a running sql-server keeps its view of every git remote it
+  has used. The push then hung until the 5-minute read timeout (or, with
+  nothing committed since the last push, reported success having written
+  nothing), and the `bd dolt push --force --remote <name>` re-run it named
+  failed the same way until the server restarted. This hit bd's own
+  auto-started server as well as servers bd does not run. Through a server,
+  reset-data now pushes the fresh store to a temporary ref of its own,
+  moves the remote's data ref to it in one update (only from the value it
+  read first), and removes the temporary ref and remote. Until that move
+  the remote keeps its data; a failure says the remote's Dolt data is
+  unchanged and names `bd dolt remote reset-data <name> --yes`, and, if the
+  temporary ref could not be deleted, the `git push <url> :<ref>` that
+  deletes it. A remote an earlier reset left without its data is rebuilt
+  the same way. The server still holds its pre-reset view of the remote
+  after the move (a later push through it could write a manifest naming
+  table files the remote does not hold, or report a branch as up to date
+  that the remote lacks), so reset-data then restarts bd's own server on
+  the same port. For a server bd does not run it prints a warning, and the
+  `--json` output sets `server_restart_required`, saying to restart that
+  server before the next push or pull of the remote. Embedded mode, and a
+  `file://` remote that Dolt stores as a file store, keep deleting the refs
+  and force-pushing. Cost: Dolt keeps a cache repository per git remote
+  and ref, so each reset through a server leaves one more copy of the fresh
+  store under the database's `.dolt/git-remote-cache` (counted in the
+  database size `bd gc` and backups report). Until the next sync the
+  server's `remotes/<name>/main` tracking ref still names the pre-reset
+  commit.
 - **`bd export` and auto-export no longer write JSONL with relations silently
   dropped** (GH#6870). When a label, dependency, comment or count read fails,
   `bd export` now exits non-zero and leaves the output file untouched, and
@@ -1375,9 +1433,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one of those variables names, now gets them directly; through the dolt
   CLI they went to that server anyway, or failed where `localhost` does
   not reach it (a server on `127.0.0.2`). Embedded mode is unchanged, and
-  so is a plain server on `127.0.0.1` whose port neither variable names,
-  bd's own or one you run yourself, which bd cannot tell apart from its
-  own by host.
+  so is a plain server on `127.0.0.1` whose port neither variable names
+  and that serves that directory, bd's own or one you run yourself: the
+  `sql-server.info` dolt keeps for the served data names the dialed port
+  and a live process. A copy no such server serves takes the server route
+  too.
   Nor do the remotes recorded in such a copy count as the server's any
   longer: `bd dolt remote add` and `bd config apply` add the remote on
   the server instead of taking the copy's as already configured. Where

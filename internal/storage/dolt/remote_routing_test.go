@@ -193,7 +193,7 @@ func TestPrepareCLIRouteForGitProtocolColdStartWindow(t *testing.T) {
 	testutil.RequireDoltBinary(t)
 	ctx := context.Background()
 
-	newColdStore := func(t *testing.T) *DoltStore {
+	newColdStore := func(t *testing.T, served bool) *DoltStore {
 		t.Helper()
 		db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 		if err != nil {
@@ -213,14 +213,19 @@ func TestPrepareCLIRouteForGitProtocolColdStartWindow(t *testing.T) {
 			database:   "testdb",
 			remote:     "origin",
 			db:         db,
+			cfg:        &Config{ServerHost: "127.0.0.1", ServerPort: testServedPort},
 		}
 		clearServerPortEnv(t)
+		// bd's own server serves the Dolt root on the dialed port.
+		if served {
+			serveDoltDir(t, store.dbPath, os.Getpid(), testServedPort)
+		}
 		initLocalDoltRepoForRemote(t, store.CLIDir())
 		return store
 	}
 
 	t.Run("persisted_git_protocol_remote_recovers_cli_route", func(t *testing.T) {
-		store := newColdStore(t)
+		store := newColdStore(t, true)
 		const url = "git+ssh://git@example.com/org/repo.git"
 		if err := doltutil.AddCLIRemote(store.CLIDir(), "origin", url); err != nil {
 			t.Fatalf("AddCLIRemote: %v", err)
@@ -236,7 +241,7 @@ func TestPrepareCLIRouteForGitProtocolColdStartWindow(t *testing.T) {
 	})
 
 	t.Run("persisted_non_git_remote_fails_with_cold_start_hint", func(t *testing.T) {
-		store := newColdStore(t)
+		store := newColdStore(t, true)
 		if err := doltutil.AddCLIRemote(store.CLIDir(), "origin", "https://doltremoteapi.dolthub.com/org/repo"); err != nil {
 			t.Fatalf("AddCLIRemote: %v", err)
 		}
@@ -252,8 +257,24 @@ func TestPrepareCLIRouteForGitProtocolColdStartWindow(t *testing.T) {
 		}
 	})
 
+	// A copy no server on the dialed port serves is not the server's data,
+	// even at 127.0.0.1: its remotes neither recover the CLI route, which
+	// would push the copy, nor explain a cold start the server is not in.
+	t.Run("persisted_remote_in_an_unserved_copy_keeps_sql_fallback", func(t *testing.T) {
+		for _, url := range []string{"git+ssh://git@example.com/org/repo.git", "https://doltremoteapi.dolthub.com/org/repo"} {
+			store := newColdStore(t, false)
+			if err := doltutil.AddCLIRemote(store.CLIDir(), "origin", url); err != nil {
+				t.Fatalf("AddCLIRemote: %v", err)
+			}
+			useCLI, err := store.prepareCLIRouteForGitProtocol(ctx, "origin")
+			if err != nil || useCLI {
+				t.Fatalf("prepareCLIRouteForGitProtocol(%s) = %v, %v; want the SQL fallback (false, nil) for a copy nothing serves", url, useCLI, err)
+			}
+		}
+	})
+
 	t.Run("nothing_persisted_keeps_sql_fallback", func(t *testing.T) {
-		store := newColdStore(t)
+		store := newColdStore(t, true)
 
 		useCLI, err := store.prepareCLIRouteForGitProtocol(ctx, "origin")
 		if err != nil {
@@ -330,9 +351,16 @@ func TestCLIRoutesUseALeftoverDatabaseOnlyWhereBdRunsTheServer(t *testing.T) {
 		// they record one that is not a dolt sql-server.
 		bdServerOnPort int
 		notDolt        bool
-		wantCLI        bool
+		// The Dolt root is served by a live server on the dialed port
+		// unless unserved is set, or servedOnPort names another port.
+		unserved     bool
+		servedOnPort int
+		wantCLI      bool
 	}{
-		{name: "host=127.0.0.1", cfg: Config{ServerHost: "127.0.0.1"}, wantCLI: true},
+		{name: "host=127.0.0.1", cfg: Config{ServerHost: "127.0.0.1", ServerPort: 3310}, wantCLI: true},
+		{name: "host=127.0.0.1/a copy nothing serves", cfg: Config{ServerHost: "127.0.0.1", ServerPort: 3310}, unserved: true},
+		{name: "host=127.0.0.1/served on another port", cfg: Config{ServerHost: "127.0.0.1", ServerPort: 3310}, servedOnPort: 3311},
+		{name: "host=127.0.0.1/BEADS_DOLT_SERVER_PORT/bd server on that port, directory not served", cfg: Config{ServerHost: "127.0.0.1", ServerPort: 3310}, portVar: "BEADS_DOLT_SERVER_PORT", bdServerOnPort: 3310, unserved: true},
 		{name: "host=127.0.0.1/BEADS_DOLT_SERVER_PORT", cfg: Config{ServerHost: "127.0.0.1", ServerPort: 3310}, portVar: "BEADS_DOLT_SERVER_PORT"},
 		{name: "host=127.0.0.1/BEADS_DOLT_PORT", cfg: Config{ServerHost: "127.0.0.1", ServerPort: 3310}, portVar: "BEADS_DOLT_PORT"},
 		{name: "host=127.0.0.1/BEADS_DOLT_SERVER_PORT/bd server on that port", cfg: Config{ServerHost: "127.0.0.1", ServerPort: 3310}, portVar: "BEADS_DOLT_SERVER_PORT", bdServerOnPort: 3310, wantCLI: true},
@@ -358,6 +386,13 @@ func TestCLIRoutesUseALeftoverDatabaseOnlyWhereBdRunsTheServer(t *testing.T) {
 				beadsDir = doltManagedWorkspace(t, tc.bdServerOnPort)
 			}
 			dbPath := filepath.Join(beadsDir, "dolt")
+			if !tc.unserved {
+				port := tc.cfg.ServerPort
+				if tc.servedOnPort != 0 {
+					port = tc.servedOnPort
+				}
+				serveDoltDir(t, dbPath, os.Getpid(), port)
+			}
 			cliDir := filepath.Join(dbPath, "beads")
 			initLocalDoltRepoForRemote(t, cliDir)
 			for name, url := range map[string]string{"origin": gitURL, "peer": gitURL, "cloud": azURL} {
@@ -444,11 +479,16 @@ func TestPushAtAHostBdDoesNotRunRunsNoDoltInTheLeftoverDatabase(t *testing.T) {
 		// notDolt makes the process bd's state files record on that port
 		// one that is not a dolt sql-server.
 		notDolt bool
-		force   bool
-		wantCLI bool
+		// unserved leaves the Dolt root without a live server on the
+		// dialed port serving it, as for a copy.
+		unserved bool
+		force    bool
+		wantCLI  bool
 	}{
 		{host: "127.0.0.1", wantCLI: true},
 		{host: "127.0.0.1", force: true, wantCLI: true},
+		{host: "127.0.0.1", unserved: true},
+		{host: "127.0.0.1", unserved: true, force: true},
 		{host: "127.0.0.1", portVar: "BEADS_DOLT_SERVER_PORT"},
 		{host: "127.0.0.1", portVar: "BEADS_DOLT_PORT", force: true},
 		{host: "127.0.0.1", portVar: "BEADS_DOLT_SERVER_PORT", bdServerOnPort: true, wantCLI: true},
@@ -469,6 +509,9 @@ func TestPushAtAHostBdDoesNotRunRunsNoDoltInTheLeftoverDatabase(t *testing.T) {
 		}
 		if tc.gateway {
 			name += "/gateway"
+		}
+		if tc.unserved {
+			name += "/a copy nothing serves"
 		}
 		t.Run(name, func(t *testing.T) {
 			if tc.portVar != "" {
@@ -504,6 +547,9 @@ func TestPushAtAHostBdDoesNotRunRunsNoDoltInTheLeftoverDatabase(t *testing.T) {
 				// The SQL route's own connection fails at once, which is how
 				// this test tells it was taken.
 				connStr: unroutableConnStr,
+			}
+			if !tc.unserved {
+				serveDoltDir(t, store.dbPath, os.Getpid(), 3310)
 			}
 			if err := os.MkdirAll(filepath.Join(store.CLIDir(), ".dolt", "noms"), 0o755); err != nil {
 				t.Fatal(err)
@@ -606,6 +652,7 @@ func TestCredentialPushOnAnEnvNamedPortKeepsTheCLIOnlyForBdsOwnServer(t *testing
 				cfg:            &Config{ServerHost: "127.0.0.1", ServerPort: 3310, BeadsDir: beadsDir},
 				connStr:        unroutableConnStr,
 			}
+			serveDoltDir(t, store.dbPath, os.Getpid(), 3310)
 			if err := os.MkdirAll(filepath.Join(store.CLIDir(), ".dolt", "noms"), 0o755); err != nil {
 				t.Fatal(err)
 			}

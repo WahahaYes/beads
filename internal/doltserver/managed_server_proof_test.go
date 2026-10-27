@@ -3,6 +3,7 @@ package doltserver
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 )
@@ -118,4 +119,82 @@ func TestManagesLiveServerOnPort(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestServesDatabaseDirOnPort pins the served-directory proof the CLI routes
+// take: the sql-server.info the dolt CLI would find for a database directory,
+// in its own .dolt or else its parent's, names the dialed port and a live
+// process (by the dolt CLI's liveness test). The first live file found
+// decides; a dead process's file counts as absent, as the dolt CLI removes
+// it.
+func TestServesDatabaseDirOnPort(t *testing.T) {
+	const port = 3307
+	const dead = 2147483646
+	live := os.Getpid()
+	info := func(t *testing.T, dir string, pid int, port string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(dir, ".dolt"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".dolt", ServerInfoFileName), []byte(strconv.Itoa(pid)+":"+port+":secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newDB := func(t *testing.T) (root, db string) {
+		root = filepath.Join(t.TempDir(), "dolt")
+		db = filepath.Join(root, "testdb")
+		if err := os.MkdirAll(filepath.Join(db, ".dolt"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return root, db
+	}
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, root, db string)
+		port  int
+		want  bool
+	}{
+		{"nothing serves it (a copy)", func(t *testing.T, root, db string) {}, port, false},
+		{"multi-database server on the dialed port", func(t *testing.T, root, db string) { info(t, root, live, strconv.Itoa(port)) }, port, true},
+		{"server started in the database itself", func(t *testing.T, root, db string) { info(t, db, live, strconv.Itoa(port)) }, port, true},
+		{"server on another port", func(t *testing.T, root, db string) { info(t, root, live, "3308") }, port, false},
+		{"server gone", func(t *testing.T, root, db string) { info(t, root, dead, strconv.Itoa(port)) }, port, false},
+		{"socket-only server", func(t *testing.T, root, db string) { info(t, root, live, "-") }, port, false},
+		{"first live file found decides", func(t *testing.T, root, db string) {
+			info(t, db, live, "3308")
+			info(t, root, live, strconv.Itoa(port))
+		}, port, false},
+		{"a dead server's file in the database falls through to its parent", func(t *testing.T, root, db string) {
+			info(t, db, dead, strconv.Itoa(port))
+			info(t, root, live, strconv.Itoa(port))
+		}, port, true},
+		{"a dead socket-only server's file in the database falls through", func(t *testing.T, root, db string) {
+			info(t, db, dead, "-")
+			info(t, root, live, strconv.Itoa(port))
+		}, port, true},
+		{"a dead server's file in the database, nothing in its parent", func(t *testing.T, root, db string) {
+			info(t, db, dead, strconv.Itoa(port))
+		}, port, false},
+		{"no dialed port", func(t *testing.T, root, db string) { info(t, root, live, "0") }, 0, false},
+	}
+	if runtime.GOOS != "windows" {
+		// PID 1 is root's: a signal from an unprivileged test fails with
+		// EPERM, which the dolt CLI takes as a live server (a container
+		// server run as another user).
+		cases = append(cases, struct {
+			name  string
+			setup func(t *testing.T, root, db string)
+			port  int
+			want  bool
+		}{"a live process of another user", func(t *testing.T, root, db string) { info(t, root, 1, strconv.Itoa(port)) }, port, true})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root, db := newDB(t)
+			tc.setup(t, root, db)
+			if got := ServesDatabaseDirOnPort(db, tc.port); got != tc.want {
+				t.Errorf("ServesDatabaseDirOnPort = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
