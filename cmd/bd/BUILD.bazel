@@ -588,6 +588,7 @@ go_test(
         "bootstrap_noninteractive_test.go",
         "bootstrap_provision_server_test.go",
         "bootstrap_registered_backend_test.go",
+        "bootstrap_seed_prefix_integration_test.go",
         "bootstrap_seedprefix_server_test.go",
         "bootstrap_seedprefix_test.go",
         "bootstrap_test.go",
