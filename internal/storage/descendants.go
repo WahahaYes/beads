@@ -11,7 +11,7 @@ import (
 // one snapshot and, on the embedded backend, one engine open rather than one
 // per tree node (GH#3415). It is not a DoltStorage method so the http client
 // store and the decorators need not implement it; SearchDescendants finds it
-// behind them the way the ExpiredDeferWaker lookup does.
+// behind them.
 type DescendantSearcher interface {
 	SearchDescendants(ctx context.Context, rootID string, filter types.IssueFilter) ([]*types.Issue, error)
 }
@@ -52,14 +52,23 @@ func WalkDescendants(ctx context.Context, rootID string, filter types.IssueFilte
 	return found, nil
 }
 
-// SearchDescendants runs the walk through the innermost store's
-// DescendantSearcher when it has one, else node by node through s.SearchIssues.
-// The capability path bypasses the decorators for this one read, as the
-// ExpiredDeferWaker lookup does; none of them changes what SearchIssues
-// returns.
+// SearchDescendants runs the walk through the outermost layer of s that is a
+// DescendantSearcher, checking each layer before unwrapping it, else node by
+// node through s.SearchIssues. A decorator that offers the capability
+// therefore gets the walk first (telemetry.InstrumentedStorage traces it, then
+// hands it on to the layers beneath), and one that does not is bypassed for
+// this one read; none of the decorators changes what SearchIssues returns.
 func SearchDescendants(ctx context.Context, s DoltStorage, rootID string, filter types.IssueFilter) ([]*types.Issue, error) {
-	if ds, ok := UnwrapStore(s).(DescendantSearcher); ok {
-		return ds.SearchDescendants(ctx, rootID, filter)
+	layer := s
+	for {
+		if ds, ok := layer.(DescendantSearcher); ok {
+			return ds.SearchDescendants(ctx, rootID, filter)
+		}
+		u, ok := layer.(Unwrapper)
+		if !ok {
+			break
+		}
+		layer = u.Unwrap()
 	}
 	return WalkDescendants(ctx, rootID, filter, func(ctx context.Context, f types.IssueFilter) ([]*types.Issue, error) {
 		return s.SearchIssues(ctx, "", f)

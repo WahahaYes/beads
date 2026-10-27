@@ -8,12 +8,16 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// testSearchDescendants pins storage.DescendantSearcher, the `bd list
-// --parent` tree walk run inside one read transaction (GH#3415): it must answer
-// exactly what the node-by-node SearchIssues(ParentID=…) walk it replaces
-// answers over the same store. Every backend RunAll is wired to (the embedded
-// and Dolt server stores) offers the capability, so its absence is a failure
-// here rather than a skip.
+// testSearchDescendants pins storage.SearchDescendants, the `bd list --parent`
+// tree walk (GH#3415): it must answer exactly what the node-by-node
+// SearchIssues(ParentID=…) walk answers over the same store. A store that
+// offers the optional storage.DescendantSearcher capability (the in-tree
+// embedded and Dolt server stores) is held to that through the capability,
+// which reads the whole tree in one read transaction; a store that does not,
+// as an out-of-tree backend need not, is held to it through the node-by-node
+// fallback bd walks it with. The capability's absence is therefore no failure
+// here: the in-tree stores' compile-time storage.DescendantSearcher assertions
+// pin that they offer it.
 //
 // The tree covers every way a ParentID search reaches a node:
 //
@@ -60,11 +64,6 @@ func testSearchDescendants(t *testing.T, f Factory) {
 		must(t, s.AddDependency(c, &types.Dependency{IssueID: edge[0], DependsOnID: edge[1], Type: types.DepParentChild}, "a"))
 	}
 
-	ds, ok := storage.UnwrapStore(s).(storage.DescendantSearcher)
-	if !ok {
-		t.Fatalf("%T does not implement storage.DescendantSearcher", storage.UnwrapStore(s))
-	}
-
 	// perNode is the walk SearchDescendants replaces, written out here rather
 	// than through storage.WalkDescendants so the two do not share a body.
 	perNode := func(t *testing.T, filter types.IssueFilter) []string {
@@ -107,7 +106,7 @@ func testSearchDescendants(t *testing.T, f Factory) {
 			if ref := perNode(t, tc.filter); !slices.Equal(ref, tc.want) {
 				t.Fatalf("per-node SearchIssues walk = %v, want %v (fixture no longer shaped as documented)", ref, tc.want)
 			}
-			got, err := ds.SearchDescendants(c, "dw-r.1", tc.filter)
+			got, err := storage.SearchDescendants(c, s, "dw-r.1", tc.filter)
 			if err != nil {
 				t.Fatalf("SearchDescendants: %v", err)
 			}

@@ -207,8 +207,7 @@ func watchIssues(ctx context.Context, store storage.DoltStorage, filter types.Is
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigChan)
 
-	pollInterval := 2 * time.Second
-	listWatchLoop(sigChan, func() <-chan time.Time { return time.After(pollInterval) }, lastSnapshot,
+	listWatchLoop(sigChan, func() <-chan time.Time { return time.After(listWatchPollInterval) }, lastSnapshot,
 		func() ([]*types.Issue, bool, error) {
 			issues, err := loadWatchedIssues(ctx, store, filter, ready, parentID, sortBy, reverse)
 			if err != nil {
@@ -224,9 +223,14 @@ func watchIssues(ctx context.Context, store storage.DoltStorage, filter types.Is
 	return nil
 }
 
-// listWatchLoop is watchIssues' refresh loop. poll is called each time the
-// loop starts waiting, which is after the previous refresh (and any redraw)
-// has returned, so every refresh is followed by a full poll interval. A
+// listWatchPollInterval is how long `bd list --watch` waits after each
+// refresh, on both routes.
+const listWatchPollInterval = 2 * time.Second
+
+// listWatchLoop is `bd list --watch`'s refresh loop on both routes
+// (watchIssues and proxiedListWatchLoop). poll is called each time the loop
+// starts waiting, which is after the previous refresh (and any redraw) has
+// returned, so every refresh is followed by a full poll interval. A
 // fixed-rate ticker instead started the next refresh the moment a slow one
 // returned, and a large watched --parent tree then kept the embedded store
 // busy almost continuously, stalling every other bd command (GH#3415). It also
