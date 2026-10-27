@@ -74,14 +74,21 @@ func TestPersistentPreRunSkipsStoreForStoreFreeConfigGet(t *testing.T) {
 	}
 
 	// Return the mutable globals a PersistentPreRunE drive touches to zero so
-	// the independent drives below cannot cross-contaminate.
-	resetPreRunGlobals := func() {
+	// the independent drives below cannot cross-contaminate. The store path
+	// writes .local_version before its open fails, so remove it too: one
+	// regressed key must not report a .local_version failure in every later
+	// subtest.
+	resetPreRunGlobals := func(t *testing.T) {
+		t.Helper()
 		serverMode = false
 		cmdCtx = nil
 		dbPath = ""
 		readonlyMode = false
 		doltAutoCommit = ""
 		store = nil
+		if err := os.Remove(filepath.Join(beadsDir, localVersionFile)); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("remove %s: %v", localVersionFile, err)
+		}
 	}
 
 	// Every key the config get RunE answers without the store (config.yaml,
@@ -89,7 +96,7 @@ func TestPersistentPreRunSkipsStoreForStoreFreeConfigGet(t *testing.T) {
 	// value) must skip store init whether or not a database exists.
 	for _, key := range []string{"dolt.server", "dolt.max-conns", "beads.role", "backup.enabled"} {
 		t.Run("store-free key "+key, func(t *testing.T) {
-			resetPreRunGlobals()
+			resetPreRunGlobals(t)
 			if err := rootCmd.PersistentPreRunE(configGetCmd, []string{key}); err != nil {
 				t.Errorf("config get %s must skip store init and return nil, got: %v", key, err)
 			}
@@ -107,16 +114,18 @@ func TestPersistentPreRunSkipsStoreForStoreFreeConfigGet(t *testing.T) {
 	// Control: a DB-backed key must still attempt store init and fail on the
 	// absent server, proving the fixture above really reaches the store path
 	// for a key the classification does not exempt (as at base).
-	resetPreRunGlobals()
+	resetPreRunGlobals(t)
 	if err := rootCmd.PersistentPreRunE(configGetCmd, []string{"storage.backend"}); err == nil {
 		t.Fatal("config get storage.backend should still attempt store init and fail on the absent database; test-environment precondition broken")
 	}
 
 	// The exemption is pinned to the `config get` command path, not to the
 	// classifier alone: configCommandCanRunWithoutStore also answers true for
-	// `config set`/`config unset` on a yaml-only key, and a leaf-name match
-	// would sweep in every other `get`. These must keep attempting store init
-	// (and failing on the absent server) exactly as at base.
+	// `config set`/`config unset` on a yaml-only key, so those two rows pin the
+	// path check. `config list` and `kv get` are sanity controls: the
+	// classifier never exempts them (it refuses any command whose parent is
+	// not `config`). All four must keep attempting store init (and failing on
+	// the absent server) exactly as at base.
 	mustStillOpenStore := []struct {
 		name string
 		cmd  *cobra.Command
@@ -129,7 +138,7 @@ func TestPersistentPreRunSkipsStoreForStoreFreeConfigGet(t *testing.T) {
 	}
 	for _, tc := range mustStillOpenStore {
 		t.Run(tc.name+" still attempts store init", func(t *testing.T) {
-			resetPreRunGlobals()
+			resetPreRunGlobals(t)
 			if err := rootCmd.PersistentPreRunE(tc.cmd, tc.args); err == nil {
 				t.Errorf("%s must still attempt store init and fail on the absent database", tc.name)
 			}

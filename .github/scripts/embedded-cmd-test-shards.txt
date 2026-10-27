@@ -46,6 +46,7 @@
 
 100 11 TestEmbeddedKVConcurrent
 
+100 12 TestEmbeddedConfigGetYamlKeyWithServerDown
 100 12 TestEmbeddedGatedRendering
 
 100 13 TestEmbeddedListFilteringStatusAndHierarchy
@@ -73,6 +74,7 @@
 100 20 TestEmbeddedInitRoleRoutingRetainedFork
 100 20 TestEmbeddedMigrateSchema_IdentityMismatchRefusesBeforeApplying
 
+100 21 TestEmbeddedConfigGetIsReadOnly
 100 21 TestEmbeddedMaxRowsReady
 100 21 TestEmbeddedMigratePersonal_movesIssues
 
