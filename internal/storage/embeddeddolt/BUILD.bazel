@@ -164,6 +164,7 @@ go_test(
         "git_ref_pin_test.go",
         "graph_counter_contract_test.go",
         "graph_walk_plan_test.go",
+        "head_hashes_test.go",
         "heartbeater_contract_test.go",
         "history_off_differential_test.go",
         "history_presence_contract_test.go",

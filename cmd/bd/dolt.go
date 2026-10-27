@@ -510,10 +510,15 @@ func isRemoteDanglingReferenceErr(err error) bool {
 }
 
 // printRemoteDanglingReferenceGuidance prints recovery guidance when a push
-// is refused because the remote reports a chunk the push points to as
-// missing. Dolt checks this before it moves the remote branch, so the
-// attempt changed nothing on the remote and nothing locally is at risk.
-func printRemoteDanglingReferenceGuidance() {
+// to remote ("" for the default remote) is refused because the remote reports
+// a chunk the push points to as missing. Dolt checks this before it moves the
+// remote branch, so the attempt did not move it and nothing locally is at
+// risk. bd dolt push, bd sync and dolt auto-push all print it. Its rule for
+// when to reseed the remote is the playbook's: only after the same hash fails
+// twice and matches neither HEAD value. bd reads those two values through st
+// itself, because bd sql, the way to read them by hand, does not run in
+// embedded mode.
+func printRemoteDanglingReferenceGuidance(ctx context.Context, st storage.DoltStorage, remote string) {
 	w := os.Stderr
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Dolt refused to update the remote: the remote reported that a chunk this")
@@ -522,26 +527,79 @@ func printRemoteDanglingReferenceGuidance() {
 	fmt.Fprintln(w, "did not move the remote branch. The check is about the remote; it is")
 	fmt.Fprintln(w, "not a sign that your local database is damaged.")
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "A different hash on each failure usually means a transient race on the")
-	fmt.Fprintln(w, "remote (another push to the same remote, or an upload it had not yet")
-	fmt.Fprintln(w, "registered). The same hash on every attempt suggests the remote itself")
-	fmt.Fprintln(w, "is damaged.")
-	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "What to do:")
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "  1. Re-run the same push once.")
+	printDanglingHeadStep(ctx, w, st)
+	fmt.Fprintln(w, "     A hash that equals either value is a transient race: the remote")
+	fmt.Fprintln(w, "     had not yet registered a chunk this push uploaded, often because")
+	fmt.Fprintln(w, "     another push to the same remote was running.")
+	fmt.Fprintln(w, "     Re-run the push in every case.")
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "  2. If it fails again with the same hash, seed a fresh remote from this")
-	fmt.Fprintln(w, "     clone, then move the other clones to it (see the playbook):")
-	fmt.Fprintln(w, "       bd dolt remote add <name> <url>")
-	fmt.Fprintln(w, "       bd dolt push --remote <name>")
+	fmt.Fprintln(w, "  2. Seed a fresh remote only when the push fails again with the same")
+	fmt.Fprintln(w, "     hash and that hash equals neither value: the remote is then")
+	fmt.Fprintln(w, "     missing a chunk it already had. Create an empty database at your")
+	printDanglingSeedStep(w, remote)
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "  3. If it keeps failing, report it to Dolt with the hash, the output of")
-	fmt.Fprintln(w, "     'dolt version', and the remote type:")
+	fmt.Fprintln(w, "  3. If it keeps failing, report it to Dolt with the hash, the remote")
+	fmt.Fprintln(w, "     type, and the output of 'bd version' (and of 'dolt version' in")
+	fmt.Fprintln(w, "     server mode):")
 	fmt.Fprintln(w, "       https://github.com/dolthub/dolt/issues")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Full playbook:")
 	fmt.Fprintln(w, "  https://github.com/gastownhall/beads/blob/main/docs/recovery/sync-failures.md#push-fails-with-found-dangling-references")
+}
+
+// printDanglingHeadStep prints step 1 of the dangling-reference guidance:
+// this clone's HEAD commit and root hashes, read through st right after the
+// failure. When bd cannot read them it says why, and in server mode prints
+// the bd sql query that reads them.
+func printDanglingHeadStep(ctx context.Context, w io.Writer, st storage.DoltStorage) {
+	commit, root, err := readHeadHashes(ctx, st)
+	if err == nil {
+		fmt.Fprintln(w, "  1. Compare the hash in the error with this clone's HEAD:")
+		fmt.Fprintf(w, "       HEAD commit: %s\n", commit)
+		fmt.Fprintf(w, "       HEAD root:   %s\n", root)
+		return
+	}
+	fmt.Fprintln(w, "  1. Compare the hash in the error with this clone's HEAD commit and")
+	fmt.Fprintf(w, "     root hashes. bd could not read them: %v\n", remedy.PrintedError(err))
+	if usesSQLServer() {
+		fmt.Fprintln(w, "     Read them with:")
+		fmt.Fprintln(w, "       bd sql \"SELECT dolt_hashof('HEAD'), dolt_hashof_db('HEAD')\"")
+	}
+}
+
+// readHeadHashes reads this clone's HEAD commit and root hashes through st.
+func readHeadHashes(ctx context.Context, st storage.DoltStorage) (commit, root string, err error) {
+	hasher, ok := storage.UnwrapStore(st).(storage.HeadHasher)
+	if !ok {
+		return "", "", errors.New("this store does not report them")
+	}
+	return hasher.GetHeadHashes(ctx)
+}
+
+// printDanglingSeedStep finishes step 2 of the dangling-reference guidance
+// with the commands that seed a fresh database for the remote the push named,
+// so they re-point the remote that failed: origin for the default remote,
+// otherwise that remote. In server mode bd sends Hosted Dolt credentials only
+// to origin (DoltStore.credentialsForRemote); the playbook covers seeding a
+// Hosted Dolt database for another remote.
+func printDanglingSeedStep(w io.Writer, remote string) {
+	if remote == "" || remote == "origin" {
+		fmt.Fprintln(w, "     provider, point origin at it, and push:")
+		fmt.Fprintln(w, "       bd dolt remote remove origin")
+		fmt.Fprintln(w, "       bd dolt remote add origin <url>")
+		fmt.Fprintln(w, "       bd dolt push")
+		fmt.Fprintln(w, "     The playbook covers moving the other clones.")
+		return
+	}
+	name, note := remedy.CommandArg(runtime.GOOS, remote, "<remote>")
+	fmt.Fprintln(w, "     provider, point this remote at it, and push:")
+	fmt.Fprintf(w, "       bd dolt remote remove %s\n", name)
+	fmt.Fprintf(w, "       bd dolt remote add %s <url>\n", name)
+	fmt.Fprintf(w, "       bd dolt push --remote %s%s\n", name, note)
+	fmt.Fprintln(w, "     In server mode bd sends Hosted Dolt credentials only to origin;")
+	fmt.Fprintln(w, "     the playbook covers that case and moving the other clones.")
 }
 
 // printNoRemoteGuidance prints an informational message (to stdout) when
@@ -695,7 +753,7 @@ The remote must already exist (see 'bd dolt remote add').`,
 				} else if isDivergedHistoryErr(err) {
 					printDivergedHistoryGuidance("push --force")
 				} else if isRemoteDanglingReferenceErr(err) {
-					printRemoteDanglingReferenceGuidance()
+					printRemoteDanglingReferenceGuidance(ctx, st, remote)
 				}
 				return SilentExit()
 			}
@@ -733,7 +791,7 @@ The remote must already exist (see 'bd dolt remote add').`,
 				}
 				printDivergedHistoryGuidance(op)
 			} else if isRemoteDanglingReferenceErr(pushErr) {
-				printRemoteDanglingReferenceGuidance()
+				printRemoteDanglingReferenceGuidance(ctx, st, "")
 			}
 			return SilentExit()
 		}

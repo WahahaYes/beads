@@ -889,6 +889,17 @@ type StateHasher interface {
 	GetStateHash(ctx context.Context) (string, error)
 }
 
+// HeadHasher reads the hash of the HEAD commit and of the root value it
+// records: DOLT_HASHOF('HEAD') and DOLT_HASHOF_DB('HEAD'). They are the two
+// chunks of a push that a remote can report missing while it is still
+// registering them, so the guidance for Dolt's "Found dangling references"
+// push refusal prints them beside the hash the refusal names. Both Dolt
+// stores implement it, the embedded one included, where bd sql does not run.
+// Callers type-assert.
+type HeadHasher interface {
+	GetHeadHashes(ctx context.Context) (commit, root string, err error)
+}
+
 // The durable mutation journal's vocabulary lives in the journalops leaf, and
 // these four names are ALIASES of it — not copies, and not a compatibility
 // shim to be deleted later. The canon is journalops: what a record carries,
