@@ -1314,32 +1314,80 @@ func executeInitAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 	}
 
 	prefix, _ := inferBootstrapPrefix(plan.BeadsDir, cfg)
-	dbName := cfg.GetDoltDatabase()
 
-	s, err := newDoltStore(ctx, &dolt.Config{
-		Path:            doltserver.ResolveDoltDir(plan.BeadsDir),
-		Database:        dbName,
-		CreateIfMissing: true,
-		AutoStart:       true,
-		BeadsDir:        plan.BeadsDir,
+	// Provision through the workspace's own store selection (server vs
+	// embedded decided by effectiveServerMode, the same gate every reader
+	// uses) so the database bootstrap creates is the one bd commands read.
+	// The hand-built embedded open this replaced wrote a server workspace's
+	// fresh database into .beads/embeddeddolt while readers dialed the
+	// server (GH#3494).
+	var seeded bool
+	err := withProvisionedBootstrapStore(ctx, plan, func(s storage.DoltStorage) error {
+		var err error
+		seeded, err = seedIssuePrefixIfMissing(ctx, s, prefix)
+		if err != nil {
+			return err
+		}
+		if seeded {
+			if err := s.CommitWithConfig(ctx, "bd bootstrap"); err != nil {
+				return fmt.Errorf("commit: %w", err)
+			}
+		}
+		wireBootstrapDoltRemote(ctx, s, plan)
+		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("create database: %w", err)
-	}
-	defer func() { _ = s.Close() }()
-
-	seeded, err := seedIssuePrefixIfMissing(ctx, s, prefix)
 	if err != nil {
 		return err
 	}
 	if seeded {
-		if err := s.CommitWithConfig(ctx, "bd bootstrap"); err != nil {
-			return fmt.Errorf("commit: %w", err)
-		}
+		fmt.Fprintf(os.Stderr, "Created fresh database with prefix %q\n", prefix)
 	}
+	return nil
+}
 
-	wireBootstrapDoltRemote(ctx, s, plan)
-	fmt.Fprintf(os.Stderr, "Created fresh database with prefix %q\n", prefix)
+// withProvisionedBootstrapStore runs fn on the database the init, restore and
+// jsonl-import actions provision (newProvisioningStoreFromConfig), closes it,
+// and then re-reads issue_prefix through the factory later commands open. A
+// write that landed anywhere else, or none at all, fails bootstrap instead of
+// being reported as done.
+func withProvisionedBootstrapStore(ctx context.Context, plan BootstrapPlan, fn func(storage.DoltStorage) error) error {
+	s, err := newProvisioningStoreFromConfig(ctx, plan.BeadsDir)
+	if err != nil {
+		return fmt.Errorf("create database: %w", err)
+	}
+	fnErr := fn(s)
+	// Close before the verification open: the embedded engine tolerates one
+	// writer at a time.
+	closeErr := s.Close()
+	if fnErr != nil {
+		return fnErr
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close database: %w", closeErr)
+	}
+	return verifyBootstrapIssuePrefix(ctx, plan.BeadsDir)
+}
+
+// verifyBootstrapIssuePrefix fails unless the database later commands open
+// for beadsDir holds an issue_prefix. A beadsDir with no metadata.json of its
+// own (bootstrap took an ancestor's, see findParentConfig) has no read path of
+// its own to check.
+func verifyBootstrapIssuePrefix(ctx context.Context, beadsDir string) error {
+	if cfg, err := configfile.Load(beadsDir); err != nil || cfg == nil {
+		return nil
+	}
+	s, err := newReadOnlyStoreFromConfig(ctx, beadsDir)
+	if err != nil {
+		return fmt.Errorf("verify issue_prefix: open database: %w", err)
+	}
+	defer func() { _ = s.Close() }()
+	prefix, err := s.GetConfig(ctx, "issue_prefix")
+	if err != nil {
+		return fmt.Errorf("verify issue_prefix: %w", err)
+	}
+	if strings.TrimSpace(prefix) == "" {
+		return errors.New("bootstrap wrote issue_prefix, but the database bd commands open for this workspace has none")
+	}
 	return nil
 }
 
@@ -1473,75 +1521,57 @@ func bootstrapMissingServerDBRefusal(dbName, location string, probeErr error) er
 
 func executeRestoreAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.Config) error {
 	prefix, _ := inferBootstrapPrefix(plan.BeadsDir, cfg)
-	dbName := cfg.GetDoltDatabase()
 
-	s, err := newDoltStore(ctx, &dolt.Config{
-		Path:            doltserver.ResolveDoltDir(plan.BeadsDir),
-		Database:        dbName,
-		CreateIfMissing: true,
-		AutoStart:       true,
-		BeadsDir:        plan.BeadsDir,
+	err := withProvisionedBootstrapStore(ctx, plan, func(s storage.DoltStorage) error {
+		seeded, err := seedIssuePrefixIfMissing(ctx, s, prefix)
+		if err != nil {
+			return err
+		}
+		if seeded {
+			if err := s.CommitWithConfig(ctx, "bd bootstrap: init"); err != nil {
+				return fmt.Errorf("commit init: %w", err)
+			}
+		}
+		if err := runBackupRestore(ctx, s, plan.BackupDir, false); err != nil {
+			return fmt.Errorf("restore from backup: %w", err)
+		}
+		wireBootstrapDoltRemote(ctx, s, plan)
+		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("create database: %w", err)
-	}
-	defer func() { _ = s.Close() }()
-
-	seeded, err := seedIssuePrefixIfMissing(ctx, s, prefix)
 	if err != nil {
 		return err
 	}
-	if seeded {
-		if err := s.CommitWithConfig(ctx, "bd bootstrap: init"); err != nil {
-			return fmt.Errorf("commit init: %w", err)
-		}
-	}
-
-	if err := runBackupRestore(ctx, s, plan.BackupDir, false); err != nil {
-		return fmt.Errorf("restore from backup: %w", err)
-	}
-
-	wireBootstrapDoltRemote(ctx, s, plan)
 	fmt.Fprintf(os.Stderr, "Restored from backup\n")
 	return nil
 }
 
 func executeJSONLImportAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.Config) error {
 	prefix, _ := inferBootstrapPrefix(plan.BeadsDir, cfg)
-	dbName := cfg.GetDoltDatabase()
 
-	s, err := newDoltStore(ctx, &dolt.Config{
-		Path:            doltserver.ResolveDoltDir(plan.BeadsDir),
-		Database:        dbName,
-		CreateIfMissing: true,
-		AutoStart:       true,
-		BeadsDir:        plan.BeadsDir,
+	var count int
+	err := withProvisionedBootstrapStore(ctx, plan, func(s storage.DoltStorage) error {
+		seeded, err := seedIssuePrefixIfMissing(ctx, s, prefix)
+		if err != nil {
+			return err
+		}
+		if seeded {
+			if err := s.CommitWithConfig(ctx, "bd bootstrap: init"); err != nil {
+				return fmt.Errorf("commit init: %w", err)
+			}
+		}
+		count, err = importFromLocalJSONL(ctx, s, plan.JSONLFile)
+		if err != nil {
+			return fmt.Errorf("import from JSONL: %w", err)
+		}
+		if err := s.Commit(ctx, "bd bootstrap: import from issues.jsonl"); err != nil {
+			return fmt.Errorf("commit import: %w", err)
+		}
+		wireBootstrapDoltRemote(ctx, s, plan)
+		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("create database: %w", err)
-	}
-	defer func() { _ = s.Close() }()
-
-	seeded, err := seedIssuePrefixIfMissing(ctx, s, prefix)
 	if err != nil {
 		return err
 	}
-	if seeded {
-		if err := s.CommitWithConfig(ctx, "bd bootstrap: init"); err != nil {
-			return fmt.Errorf("commit init: %w", err)
-		}
-	}
-
-	count, err := importFromLocalJSONL(ctx, s, plan.JSONLFile)
-	if err != nil {
-		return fmt.Errorf("import from JSONL: %w", err)
-	}
-
-	if err := s.Commit(ctx, "bd bootstrap: import from issues.jsonl"); err != nil {
-		return fmt.Errorf("commit import: %w", err)
-	}
-
-	wireBootstrapDoltRemote(ctx, s, plan)
 	fmt.Fprintf(os.Stderr, "Imported %d issues from %s\n", count, plan.JSONLFile)
 	return nil
 }
