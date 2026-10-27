@@ -151,7 +151,9 @@ func writeFakeAndroidNDK(t *testing.T, root, revision string) {
 
 func runInstallAndroidNDK(t *testing.T, opts installAndroidNDKOptions) installAndroidNDKRun {
 	t.Helper()
-	if runtime.GOOS == "windows" {
+	// Not only Windows: the download path renames with GNU mv -T, which
+	// macOS's mv lacks, and the faked uname cannot change that.
+	if runtime.GOOS != "linux" {
 		t.Skip("the android NDK install is Linux x86_64 only")
 	}
 	if opts.digest == "" {

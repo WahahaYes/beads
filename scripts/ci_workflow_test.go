@@ -297,8 +297,8 @@ func readGoreleaserBuilds(t *testing.T) []goreleaserBuild {
 // wrapper that reads ANDROID_NDK_HOME (the runner image's older NDK).
 func TestGoreleaserAndroidArm64BuildsWithNDKCGO(t *testing.T) {
 	const (
-		wantCC  = "CC={{ .Env.PWD }}/scripts/ci/android-arm64-cc"
-		wantCXX = "CXX={{ .Env.PWD }}/scripts/ci/android-arm64-cxx"
+		wantCC  = `CC={{ abs "." }}/scripts/ci/android-arm64-cc`
+		wantCXX = `CXX={{ abs "." }}/scripts/ci/android-arm64-cxx`
 	)
 	wantHooks := []string{
 		`./scripts/verify-cgo.sh "{{ .Path }}"`,
@@ -344,6 +344,42 @@ func TestGoreleaserAndroidArm64BuildsWithNDKCGO(t *testing.T) {
 	if !reflect.DeepEqual(build.Hooks.Post, wantHooks) {
 		t.Errorf("%s post hooks = %q, want %q", build.ID, build.Hooks.Post, wantHooks)
 	}
+}
+
+// TestGoreleaserReadsOnlyEnvTheReleaseStepSets: release.yml runs goreleaser
+// through goreleaser-action, which starts it without a shell, so a variable
+// only a shell sets (PWD, the first #3538 CC path) is unset there. goreleaser
+// templates fail on a missing key, so one such .Env read aborts the tagged
+// release for every platform, while RELEASING.md's shell-run snapshot passes.
+// Every .Env read must name a variable the workflow, the job or the step
+// sets, or one the runner sets for every step. YAML comments are not read.
+func TestGoreleaserReadsOnlyEnvTheReleaseStepSets(t *testing.T) {
+	workflow := readCIWorkflow(t, "release.yml")
+	job := workflow.job(t, "goreleaser")
+	step := job.step(t, "Run GoReleaser")
+	if !strings.HasPrefix(step.Uses, "goreleaser/goreleaser-action@") {
+		t.Fatalf("release.yml step %q uses %q, want goreleaser/goreleaser-action; update this test", step.Name, step.Uses)
+	}
+	set := map[string]bool{"CI": true}
+	for _, env := range []map[string]string{workflow.Env, job.Env, step.Env} {
+		for name := range env {
+			set[name] = true
+		}
+	}
+
+	envRead := regexp.MustCompile(`\.Env\.(\w+)`)
+	walkYAML(readYAMLNode(t, ".goreleaser.yml"), "", func(path string, key bool, value string) {
+		if key {
+			return
+		}
+		for _, match := range envRead.FindAllStringSubmatch(value, -1) {
+			name := match[1]
+			if set[name] || strings.HasPrefix(name, "GITHUB_") || strings.HasPrefix(name, "RUNNER_") {
+				continue
+			}
+			t.Errorf(".goreleaser.yml: %s reads .Env.%s, which release.yml's %q step does not set; set it in that step's env, or use a template function such as abs \".\"", path, name, step.Name)
+		}
+	})
 }
 
 // Exclude read-permission coverage is required, not best effort: Bazel's
