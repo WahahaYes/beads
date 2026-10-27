@@ -56,6 +56,7 @@
 34 4 TestProxiedServerServeRelatedIssues
 34 4 TestProxiedServerServeSettingsWrites
 34 4 TestProxiedServerShow2
+34 4 TestProxiedServerTopologyCapabilityMatrix
 34 4 TestServerModeServeSkipsPostRunMaintenance
 
 34 5 TestProxiedServerHistoryRemoteRefusalFrontDoorMatrix
