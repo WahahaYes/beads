@@ -32,8 +32,7 @@ lease is recorded as a recovery event.
 
 --older-than is a grace window past lease expiry: only leases that expired at
 least this long ago are reclaimed, so a worker briefly paused (GC, clock skew)
-is not robbed of live work. Run it from a supervisor on a timer with a window
-of roughly 2× the claim TTL.
+is not robbed of live work. Run it from a supervisor on a timer.
 
 By default reclaim covers every stale lease THIS replica granted. The scope
 filters below narrow it further, using the same label surface claiming is

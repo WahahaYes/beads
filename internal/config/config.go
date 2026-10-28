@@ -1159,7 +1159,7 @@ func NodeID() string {
 // ClaimLeaseTTL returns claim.lease-ttl (BD_CLAIM_LEASE_TTL), or 0 when it is
 // unset, unparsable or not positive, leaving the caller's default in force.
 func ClaimLeaseTTL() time.Duration {
-	if ttl := GetDuration("claim.lease-ttl"); ttl > 0 {
+	if ttl, err := time.ParseDuration(strings.TrimSpace(GetString("claim.lease-ttl"))); err == nil && ttl > 0 {
 		return ttl
 	}
 	return 0

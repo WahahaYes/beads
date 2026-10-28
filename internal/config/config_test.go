@@ -2389,6 +2389,7 @@ func TestClaimLeaseTTL(t *testing.T) {
 		{"0s", 0},
 		{"-5m", 0},
 		{"soon", 0},
+		{"300", 0},
 	} {
 		Set("claim.lease-ttl", tc.value)
 		if got := ClaimLeaseTTL(); got != tc.want {
